@@ -1,9 +1,19 @@
 """
-Simple Streamlit UI for Job Scam Detector
-Clean, minimal interface - just paste a job description and see if it's real or fake
-Run: streamlit run app.py
+app.py
+======
+Location in your repo: app.py  (root)
+
+Run locally:  streamlit run app.py
+Deploy:       Works on Vercel (no torch, no heavy deps)
+
+WHAT CHANGED vs your original:
+  - Reads HF_API_TOKEN env var to decide whether semantic layer is active
+  - Shows clear status indicators for ML model + HF API availability
+  - Added optional title/company fields to match the API
+  - Removed use_embeddings=False hardcode — now auto-detected from env var
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -14,83 +24,104 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from hybrid_detector import HybridDetector
 
-# Page config
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Job Detector",
-    page_icon="✨",
+    page_title="Job Scam Detector",
+    page_icon="🔍",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
 
-# Minimal styling
 st.markdown("""
 <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
-    
-    .result-real {
-        background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
-        border: 2px solid #28a745;
-        color: #155724;
-        padding: 20px;
-        border-radius: 8px;
-        text-align: center;
-    }
-    
-    .result-fake {
-        background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%);
-        border: 2px solid #dc3545;
-        color: #721c24;
-        padding: 20px;
-        border-radius: 8px;
-        text-align: center;
-    }
-    
-    .confidence { font-size: 2em; font-weight: bold; margin: 10px 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.result-real {
+    background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
+    border: 2px solid #28a745;
+    color: #155724;
+    padding: 20px;
+    border-radius: 8px;
+    text-align: center;
+}
+.result-fake {
+    background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%);
+    border: 2px solid #dc3545;
+    color: #721c24;
+    padding: 20px;
+    border-radius: 8px;
+    text-align: center;
+}
+.confidence { font-size: 2em; font-weight: bold; margin: 10px 0; }
 </style>
 """, unsafe_allow_html=True)
 
-# Load detector
+
+# ── Load detector (cached so it stays alive across requests) ──────────────────
 @st.cache_resource
 def load_detector():
-    detector = HybridDetector(use_embeddings=False)
+    hf_token_present = bool(os.environ.get("HF_API_TOKEN", "").strip())
+    detector = HybridDetector(use_embeddings=hf_token_present)
+
     model_dir = Path("models")
-    if model_dir.exists() and (model_dir / "tfidf_lr.joblib").exists():
+    model_loaded = False
+    if model_dir.exists() and (model_dir / "tfidf.joblib").exists():
         try:
             detector.load(str(model_dir))
-            return detector, True
-        except Exception:
-            pass
-    return detector, False
+            model_loaded = True
+        except Exception as exc:
+            st.warning(f"Could not load saved models: {exc}")
 
-detector, model_loaded = load_detector()
+    return detector, model_loaded, hf_token_present
 
-# Simple title
-st.markdown("# ✨ Job Detector")
-st.markdown("*Is this job description real or fake?*")
+
+detector, model_loaded, hf_active = load_detector()
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+st.markdown("# 🔍 Job Scam Detector")
+st.markdown("*Paste any job description to check if it's real or fake.*")
+
+# Status badges
+col1, col2 = st.columns(2)
+with col1:
+    if model_loaded:
+        st.success("✅ ML models loaded")
+    else:
+        st.info("⚡ Rule-based mode (no saved models found)")
+with col2:
+    if hf_active:
+        st.success("✅ Semantic layer active (HF API)")
+    else:
+        st.warning("⚠️ Set HF_API_TOKEN for semantic layer")
+
 st.markdown("---")
 
-# Input
+# Input fields
 st.markdown("### 📝 Paste Job Description")
 job_text = st.text_area(
     "Job Description",
-    height=200,
-    placeholder="Paste the job description here...",
-    label_visibility="collapsed"
+    height=220,
+    placeholder="Paste the full job description here...",
+    label_visibility="collapsed",
 )
 
+col_a, col_b = st.columns(2)
+with col_a:
+    title = st.text_input("Job title (optional)", placeholder="e.g. Data Entry Operator")
+with col_b:
+    company = st.text_input("Company name (optional)", placeholder="e.g. TechCorp Pvt Ltd")
+
 # Analyze button
-if st.button("🔍 Check", type="primary", use_container_width=True):
+if st.button("🔍 Analyze Job Post", type="primary", use_container_width=True):
     if job_text.strip():
         with st.spinner("Analyzing..."):
             t0 = time.perf_counter()
-            result = detector.predict(text=job_text)
+            result = detector.predict(text=job_text, title=title, company=company)
             elapsed = (time.perf_counter() - t0) * 1000
 
-        # Display result
-        is_fake = result.prediction == "FAKE"
+        is_fake      = result.prediction == "FAKE"
         result_class = "result-fake" if is_fake else "result-real"
-        verdict_text = "🚨 FAKE" if is_fake else "✅ REAL"
-        
+        verdict_text = "🚨 FAKE JOB POST" if is_fake else "✅ LOOKS LEGITIMATE"
+
         st.markdown(f"""
         <div class="{result_class}">
             <div class="confidence">{verdict_text}</div>
@@ -98,24 +129,28 @@ if st.button("🔍 Check", type="primary", use_container_width=True):
             <div>Risk Level: <strong>{result.risk_level}</strong></div>
         </div>
         """, unsafe_allow_html=True)
-        
-        # Show details if there are risk flags
+
+        st.markdown("")  # spacer
+
         if result.risk_flags:
             st.markdown("### ⚠️ Red Flags Detected")
             for flag in result.risk_flags:
                 st.write(f"• {flag}")
-        
-        # Explanation
-        st.markdown("### 📌 Why?")
+
+        st.markdown("### 📌 Explanation")
         st.info(result.explanation)
-        
-        st.caption(f"Analyzed in {elapsed:.0f}ms")
+
+        with st.expander("🔢 Detailed scores"):
+            st.json(result.scores)
+
+        st.caption(f"Analyzed in {elapsed:.0f} ms")
     else:
-        st.warning("Please paste a job description to analyze.")
+        st.warning("Please paste a job description first.")
 
 st.markdown("---")
-st.markdown("""
-<small style="color: gray; text-align: center; display: block;">
-Model Status: {'✅ Pre-trained models loaded' if model_loaded else '⚡ Using rule-based detection only'}
-</small>
-""", unsafe_allow_html=True)
+st.markdown(
+    "<small style='color:gray;text-align:center;display:block;'>"
+    "Detection layers: Rule engine (15 rules) + TF-IDF + Semantic embeddings via HF API"
+    "</small>",
+    unsafe_allow_html=True,
+)

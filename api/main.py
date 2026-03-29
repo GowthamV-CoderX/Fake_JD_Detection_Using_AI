@@ -1,4 +1,17 @@
-from __future__ import annotations
+"""
+api/main.py
+===========
+Location in your repo: api/main.py
+
+WHAT CHANGED vs your original:
+  - Removed torch / sentence-transformers — no local heavy models
+  - Detector loads from HF_API_TOKEN env var (set in Vercel dashboard)
+  - Lazy init: detector created once on first request (Vercel cold-start safe)
+  - Health endpoint added
+  - Batch endpoint capped at 20 to avoid timeout on free Vercel tier
+"""
+
+import os
 import sys
 import time
 from pathlib import Path
@@ -6,103 +19,119 @@ from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel
 
-sys.path.insert(0, str(Path(__file__).parent))
-from hybrid_detector import HybridDetector, DetectionResult
+# Make root-level modules importable (embedding_model, tfidf_model, etc.)
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# ────────── APP SETUP ──────────
-app = FastAPI(title="Job Scam Detector API", version="1.0.0")
+from hybrid_detector import HybridDetector
+
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Job Scam Detector API",
+    description=(
+        "Multi-layer fake job description detector. "
+        "Combines rule engine, TF-IDF, and semantic embeddings (via HF API)."
+    ),
+    version="2.0.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
-
-@app.get("/", response_class=HTMLResponse)
-def website():
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
+# ── Detector singleton ────────────────────────────────────────────────────────
+_detector: Optional[HybridDetector] = None
 
 
-# ────────── GLOBAL DETECTOR ──────────
-detector: Optional[HybridDetector] = None
+def get_detector() -> HybridDetector:
+    global _detector
+    if _detector is None:
+        hf_token_present = bool(os.environ.get("HF_API_TOKEN", "").strip())
+        _detector = HybridDetector(use_embeddings=hf_token_present)
 
-@app.on_event("startup")
-async def startup_event():
-    global detector
-    model_dir = Path("models")
-    detector = HybridDetector(use_embeddings=True)
-    try:
-        if model_dir.exists():
-            detector.load(str(model_dir))
-            print("✅ [API] Models loaded successfully.")
+        model_dir = Path("models")
+        if model_dir.exists() and (model_dir / "tfidf.joblib").exists():
+            try:
+                _detector.load(str(model_dir))
+                print("✅ Pre-trained models loaded successfully.")
+            except Exception as exc:
+                print(f"⚠️  Could not load saved models ({exc}). Running rule-only mode.")
         else:
-            print("⚠️ [API] No models found. Running in rule-only mode.")
-    except Exception as e:
-        print("🔥 MODEL LOAD CRASHED:", str(e))
-        raise e
+            print("⚡ No saved models found. Running rule-based mode.")
+
+    return _detector
 
 
-# ────────── REQUEST MODELS ──────────
-class JobInput(BaseModel):
-    text: str = Field(..., min_length=10)
-    title: Optional[str] = ""
-    company: Optional[str] = ""
-
-    @validator("text")
-    def validate_text(cls, v):
-        if not v.strip():
-            raise ValueError("Text cannot be empty")
-        return v
-
-class PredictionResponse(BaseModel):
-    prediction: str
-    confidence: int
-    risk_level: str
-    risk_flags: List[str]
-    explanation: str
-    scores: dict
-    processing_time_ms: float
+# ── Schemas ───────────────────────────────────────────────────────────────────
+class JobRequest(BaseModel):
+    text: str
+    title: str = ""
+    company: str = ""
 
 
-# ────────── HELPERS ──────────
-def result_to_response(result: DetectionResult, elapsed_ms: float):
+class BatchRequest(BaseModel):
+    jobs: List[JobRequest]
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    hf_active = bool(os.environ.get("HF_API_TOKEN", "").strip())
     return {
-        "prediction": result.prediction,
-        "confidence": result.confidence,
-        "risk_level": result.risk_level,
-        "risk_flags": result.risk_flags,
-        "explanation": result.explanation,
-        "scores": result.scores,
-        "processing_time_ms": round(elapsed_ms, 2),
+        "service": "Job Scam Detector API",
+        "version": "2.0.0",
+        "status": "ok",
+        "semantic_layer": "active (HF Inference API)" if hf_active else "inactive — set HF_API_TOKEN env var",
+        "docs": "/docs",
+        "endpoints": ["/predict", "/predict/batch", "/health"],
     }
 
 
-# ────────── ROUTES ──────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": detector._trained if detector else False}
+    return {"status": "ok"}
 
-@app.post("/predict", response_model=PredictionResponse)
-def predict(job: JobInput):
-    if not detector:
-        raise HTTPException(status_code=503, detail="Detector not initialized")
-    try:
-        start = time.perf_counter()
-        result = detector.predict(text=job.text, title=job.title or "", company=job.company or "")
-        elapsed = (time.perf_counter() - start) * 1000
-        return result_to_response(result, elapsed)
-    except Exception as e:
-        print("🔥 PREDICTION ERROR:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/debug")
-def debug():
-    return {"detector_loaded": detector is not None, "model_trained": detector._trained if detector else False}
+@app.post("/predict")
+def predict(req: JobRequest):
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="'text' field cannot be empty.")
+
+    t0 = time.perf_counter()
+    result = get_detector().predict(
+        text=req.text,
+        title=req.title,
+        company=req.company,
+    )
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+    return {**result.to_dict(), "processing_time_ms": elapsed_ms}
+
+
+@app.post("/predict/batch")
+def predict_batch(req: BatchRequest):
+    if not req.jobs:
+        raise HTTPException(status_code=400, detail="'jobs' list cannot be empty.")
+    if len(req.jobs) > 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Batch size limit is 20 jobs per request."
+        )
+
+    t0 = time.perf_counter()
+    detector = get_detector()
+    results = []
+    for job in req.jobs:
+        r = detector.predict(text=job.text, title=job.title, company=job.company)
+        results.append(r.to_dict())
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+    return {
+        "results": results,
+        "count": len(results),
+        "total_time_ms": elapsed_ms,
+    }
