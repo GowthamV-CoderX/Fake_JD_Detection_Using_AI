@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Job Scam Detector</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: auto;
+            padding: 20px;
+        }
+        textarea, input {
+            width: 100%;
+            margin-bottom: 10px;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+        button {
+            padding: 10px 20px;
+            cursor: pointer;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 15px;
+            border: 1px solid #ccc;
+        }
+    </style>
+</head>
+<body>
+    <h2>🚨 Job Scam Detector</h2>
+    <input id="title" placeholder="Job Title">
+    <input id="company" placeholder="Company Name">
+    <textarea id="text" rows="6" placeholder="Paste job description here..."></textarea>
+    <button onclick="analyze()">Analyze</button>
+    <div id="result"></div>
+
+    <script>
+    console.log("JS LOADED");
+
+    document.addEventListener("DOMContentLoaded", () => {
+        const btn = document.querySelector("button");
+
+        btn.addEventListener("click", async () => {
+            console.log("Analyze clicked");
+
+            const data = {
+                title: document.getElementById("title").value,
+                company: document.getElementById("company").value,
+                text: document.getElementById("text").value
+            };
+
+            console.log("Sending data:", data);
+
+            const resultDiv = document.getElementById("result");
+
+            try {
+                const res = await fetch("/predict", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify(data)
+                });
+
+                console.log("Response status:", res.status);
+
+                const json = await res.json();
+                console.log("Response JSON:", json);
+
+                resultDiv.innerHTML = `
+                    <h3>Prediction: ${json.prediction}</h3>
+                    <p><b>Confidence:</b> ${json.confidence}%</p>
+                    <p><b>Risk Level:</b> ${json.risk_level}</p>
+                    <p><b>Flags:</b> ${json.risk_flags.join(", ")}</p>
+                    <p><b>Explanation:</b> ${json.explanation}</p>
+            `   ;
+
+            } catch (err) {
+                console.error("ERROR:", err);
+                resultDiv.innerHTML = `<pre>${err}</pre>`;
+            }
+        });
+    });
+</script>
+</body>
+</html>
